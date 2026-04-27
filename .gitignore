@@ -1,0 +1,9 @@
+# Environment — contains real credentials, never commit
+.env
+
+# Composer dependencies
+/vendor/
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Add Money — UPI Wallet</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #0f1117;
+    --surface:  #1a1d27;
+    --border:   #2a2d3e;
+    --text:     #e2e8f0;
+    --muted:    #8892a4;
+    --accent:   #6366f1;
+    --green:    #22c55e;
+    --yellow:   #eab308;
+    --red:      #ef4444;
+    --radius:   14px;
+  }
+
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 36px 32px;
+    width: 100%;
+    max-width: 420px;
+    box-shadow: 0 8px 40px rgba(0,0,0,.5);
+  }
+
+  .card-title {
+    font-size: 1.35rem;
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+
+  .card-sub {
+    color: var(--muted);
+    font-size: .88rem;
+    margin-bottom: 28px;
+  }
+
+  label {
+    display: block;
+    font-size: .8rem;
+    text-transform: uppercase;
+    letter-spacing: .07em;
+    color: var(--muted);
+    margin-bottom: 7px;
+  }
+
+  input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 11px 14px;
+    border-radius: 9px;
+    font-size: .95rem;
+    outline: none;
+    transition: border-color .15s;
+    margin-bottom: 18px;
+  }
+
+  input:focus { border-color: var(--accent); }
+
+  button {
+    width: 100%;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 13px;
+    border-radius: 9px;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity .15s;
+    margin-top: 4px;
+  }
+
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  button:not(:disabled):hover { opacity: .87; }
+
+  /* ── Status box ── */
+  #status-box {
+    display: none;
+    margin-top: 22px;
+    padding: 16px;
+    border-radius: 10px;
+    font-size: .9rem;
+    font-weight: 500;
+    text-align: center;
+    border: 1px solid transparent;
+    line-height: 1.5;
+  }
+
+  #status-box.pending {
+    background: rgba(234,179,8,.1);
+    border-color: rgba(234,179,8,.3);
+    color: var(--yellow);
+  }
+
+  #status-box.success {
+    background: rgba(34,197,94,.1);
+    border-color: rgba(34,197,94,.3);
+    color: var(--green);
+  }
+
+  #status-box.error {
+    background: rgba(239,68,68,.1);
+    border-color: rgba(239,68,68,.3);
+    color: var(--red);
+  }
+
+  /* ── Spinner dots ── */
+  .dots span {
+    display: inline-block;
+    animation: blink 1.2s infinite;
+    font-size: 1.3rem;
+    line-height: 1;
+  }
+
+  .dots span:nth-child(2) { animation-delay: .2s; }
+  .dots span:nth-child(3) { animation-delay: .4s; }
+
+  @keyframes blink {
+    0%, 80%, 100% { opacity: 0; }
+    40%           { opacity: 1; }
+  }
+
+  /* ── Attempt counter ── */
+  #attempt-info {
+    display: none;
+    text-align: center;
+    font-size: .78rem;
+    color: var(--muted);
+    margin-top: 10px;
+  }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <div class="card-title">⚡ Add Money</div>
+  <div class="card-sub">Pay via BharatPe QR, then enter your UTR to confirm.</div>
+
+  <form id="pay-form" onsubmit="return false;">
+
+    <!-- In production, user_id comes from session — hardcoded here for demo -->
+    <input type="hidden" id="user_id" value="1">
+
+    <label for="utr">UTR / Transaction Reference</label>
+    <input
+      type="text"
+      id="utr"
+      placeholder="e.g. 407311819222"
+      maxlength="64"
+      autocomplete="off"
+      spellcheck="false"
+    >
+
+    <label for="amount">Amount (₹)</label>
+    <input
+      type="number"
+      id="amount"
+      placeholder="e.g. 500"
+      min="1"
+      step="0.01"
+    >
+
+    <button type="button" id="verify-btn" onclick="verifyPayment()">
+      Verify Payment
+    </button>
+
+  </form>
+
+  <div id="status-box"></div>
+  <div id="attempt-info"></div>
+</div>
+
+<script>
+// ── Config ────────────────────────────────────────────────────
+const MAX_ATTEMPTS   = 10;   // stop polling after this many checks
+const POLL_INTERVAL  = 3000; // ms between each check-status.php call
+
+// ── State ─────────────────────────────────────────────────────
+let pollTimer   = null;
+let attempts    = 0;
+
+// ── UI helpers ────────────────────────────────────────────────
+function setStatus(type, html) {
+  const box = document.getElementById('status-box');
+  box.className  = type;
+  box.innerHTML  = html;
+  box.style.display = 'block';
+}
+
+function setAttemptInfo(text) {
+  const el = document.getElementById('attempt-info');
+  el.style.display = text ? 'block' : 'none';
+  el.textContent   = text;
+}
+
+function setButtonBusy(busy) {
+  const btn = document.getElementById('verify-btn');
+  btn.disabled    = busy;
+  btn.textContent = busy ? 'Verifying…' : 'Verify Payment';
+}
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  setAttemptInfo('');
+}
+
+// ── Step 1: initial verify call ───────────────────────────────
+function verifyPayment() {
+  stopPolling();
+  attempts = 0;
+
+  const utr    = document.getElementById('utr').value.trim();
+  const amount = parseFloat(document.getElementById('amount').value);
+  const userId = parseInt(document.getElementById('user_id').value, 10);
+
+  if (!utr || utr.length < 8) {
+    setStatus('error', '⚠️ Please enter a valid UTR (minimum 8 characters).');
+    return;
+  }
+
+  if (!amount || amount <= 0) {
+    setStatus('error', '⚠️ Please enter a valid amount.');
+    return;
+  }
+
+  setButtonBusy(true);
+  setStatus('pending', 'Checking with BharatPe <span class="dots"><span>•</span><span>•</span><span>•</span></span>');
+
+  fetch('/verify-payment.php', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ user_id: userId, utr, amount }),
+  })
+    .then(r => r.json())
+    .then(data => {
+      setButtonBusy(false);
+
+      if (data.status === 'success') {
+        handleSuccess(data.balance);
+      } else if (data.status === 'pending') {
+        setStatus('pending',
+          '⏳ Payment not found yet.<br>Auto-checking every 3 seconds <span class="dots"><span>•</span><span>•</span><span>•</span></span>'
+        );
+        startPolling(utr, amount);
+      } else {
+        // error / duplicate
+        setStatus('error', '❌ ' + (data.message || 'Something went wrong.'));
+      }
+    })
+    .catch(() => {
+      setButtonBusy(false);
+      setStatus('error', '❌ Network error. Please try again.');
+    });
+}
+
+// ── Step 2: poll check-status.php ─────────────────────────────
+function startPolling(utr, amount) {
+  attempts = 0;
+
+  pollTimer = setInterval(() => {
+    attempts++;
+    setAttemptInfo(`Check ${attempts} of ${MAX_ATTEMPTS}…`);
+
+    fetch('/check-status.php?utr=' + encodeURIComponent(utr))
+      .then(r => r.json())
+      .then(data => {
+        if (data.status === 'success') {
+          stopPolling();
+          handleSuccess(data.balance);
+          return;
+        }
+
+        if (data.status === 'failed') {
+          stopPolling();
+          setStatus('error', '❌ Payment marked as failed. Please contact support.');
+          return;
+        }
+
+        // still pending — keep waiting
+        if (attempts >= MAX_ATTEMPTS) {
+          stopPolling();
+          setStatus('pending',
+            '⏳ Still pending after ' + MAX_ATTEMPTS + ' checks.<br>' +
+            'Your payment will be credited automatically once confirmed.<br>' +
+            '<small style="opacity:.7">Refresh this page in a few minutes.</small>'
+          );
+        }
+      })
+      .catch(() => {
+        // silent — don't abort polling on a single network blip
+      });
+
+  }, POLL_INTERVAL);
+}
+
+// ── Success handler ───────────────────────────────────────────
+function handleSuccess(balance) {
+  const balStr = typeof balance === 'number'
+    ? '₹' + balance.toFixed(2)
+    : '';
+
+  setStatus('success',
+    '✅ Payment Verified!<br>' +
+    (balStr ? '<span style="font-size:1.1rem;font-weight:700;">' + balStr + '</span> new wallet balance' : '')
+  );
+
+  // Reset form
+  document.getElementById('utr').value    = '';
+  document.getElementById('amount').value = '';
+}
+</script>
+
+</body>
+</html>
