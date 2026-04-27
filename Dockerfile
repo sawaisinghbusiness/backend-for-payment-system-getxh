@@ -1,33 +1,53 @@
 FROM php:8.1-apache
 
-# System deps for MongoDB extension
+# System dependencies for MongoDB extension
 RUN apt-get update && apt-get install -y \
-    libssl-dev pkg-config git unzip \
- && rm -rf /var/lib/apt/lists/*
+    libssl-dev \
+    pkg-config \
+    git \
+    unzip \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# MongoDB PHP extension
-RUN pecl install mongodb && docker-php-ext-enable mongodb
+# MongoDB PHP extension (pinned version = stable build)
+RUN pecl install mongodb-1.16.2 \
+    && docker-php-ext-enable mongodb
 
 # Composer
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
-# Apache modules
+# Enable Apache modules
 RUN a2enmod rewrite headers
-RUN sed -i 's/AllowOverride None/AllowOverride All/g' /etc/apache2/apache2.conf
+
+# Apache VirtualHost with AllowOverride All
+RUN { \
+    echo '<VirtualHost *:80>'; \
+    echo '    DocumentRoot /var/www/html'; \
+    echo '    <Directory /var/www/html>'; \
+    echo '        AllowOverride All'; \
+    echo '        Require all granted'; \
+    echo '    </Directory>'; \
+    echo '    ErrorLog ${APACHE_LOG_DIR}/error.log'; \
+    echo '    CustomLog ${APACHE_LOG_DIR}/access.log combined'; \
+    echo '</VirtualHost>'; \
+} > /etc/apache2/sites-available/000-default.conf
+
 RUN echo "ServerName localhost" >> /etc/apache2/apache2.conf
 
-# Copy project files
-COPY . /var/www/html/
+WORKDIR /var/www/html
 
-# Install PHP dependencies
-RUN cd /var/www/html && composer install --no-dev --optimize-autoloader
+# Copy and install dependencies first (Docker layer cache)
+COPY composer.json ./
+RUN composer install --no-dev --optimize-autoloader --no-interaction --no-scripts
 
-# Remove sensitive files
-RUN rm -f /var/www/html/.env \
-           /var/www/html/backup.sh \
-           /var/www/html/migrate.sql \
-           /var/www/html/schema.sql
+# Copy all project files
+COPY . .
 
-RUN chown -R www-data:www-data /var/www/html
+# Remove sensitive files from image
+RUN rm -f .env backup.sh migrate.sql schema.sql
+
+# Permissions
+RUN chown -R www-data:www-data /var/www/html \
+    && chmod -R 755 /var/www/html
 
 EXPOSE 80
