@@ -1,20 +1,19 @@
 <?php
-// ============================================================
-// Core business logic
-// ============================================================
-
 declare(strict_types=1);
 
 require_once __DIR__ . '/db.php';
 
-define('BHARATPE_MAX_AGE_SECONDS',  30 * 60); // 30 min freshness window
-define('BHARATPE_TXN_SCAN_LIMIT',  20);       // max transactions to inspect
-define('BHARATPE_MAX_RETRIES',     2);        // cURL retry attempts
-define('BHARATPE_FAIL_THRESHOLD',  5);        // failures before alert email
-define('BHARATPE_FAIL_WINDOW_MIN', 10);       // failure count window (minutes)
-define('PAYMENT_STALE_SECONDS',    3600);     // 60 min → auto-expire pending
+use MongoDB\BSON\ObjectId;
+use MongoDB\BSON\UTCDateTime;
 
-// ── Structured logger ────────────────────────────────────────────────────────
+define('BHARATPE_MAX_AGE_SECONDS',  30 * 60);
+define('BHARATPE_TXN_SCAN_LIMIT',  20);
+define('BHARATPE_MAX_RETRIES',     2);
+define('BHARATPE_FAIL_THRESHOLD',  5);
+define('BHARATPE_FAIL_WINDOW_MIN', 10);
+define('PAYMENT_STALE_SECONDS',    3600);
+
+// ── Structured logger ─────────────────────────────────────────
 function logBharatPe(string $event, array $ctx = []): void
 {
     error_log('[BharatPe] ' . json_encode(
@@ -23,22 +22,24 @@ function logBharatPe(string $event, array $ctx = []): void
     ));
 }
 
-// ── API failure tracker + email alert ───────────────────────────────────────
+// ── API failure tracker ───────────────────────────────────────
 function trackApiFailure(): void
 {
     try {
-        $db = getDB();
-        $db->prepare(
-            "INSERT INTO rate_limits (ip, action, identifier) VALUES ('system', 'bharatpe_api_fail', '')"
-        )->execute();
+        $db     = getDB();
+        $cutoff = new UTCDateTime((time() - BHARATPE_FAIL_WINDOW_MIN * 60) * 1000);
 
-        $stmt = $db->prepare(
-            "SELECT COUNT(*) FROM rate_limits
-             WHERE action = 'bharatpe_api_fail'
-             AND created_at > DATE_SUB(NOW(), INTERVAL ? MINUTE)"
-        );
-        $stmt->execute([BHARATPE_FAIL_WINDOW_MIN]);
-        $count = (int)$stmt->fetchColumn();
+        $db->rate_limits->insertOne([
+            'ip'         => 'system',
+            'action'     => 'bharatpe_api_fail',
+            'identifier' => '',
+            'created_at' => new UTCDateTime(),
+        ]);
+
+        $count = $db->rate_limits->countDocuments([
+            'action'     => 'bharatpe_api_fail',
+            'created_at' => ['$gt' => $cutoff],
+        ]);
 
         if ($count >= BHARATPE_FAIL_THRESHOLD) {
             $email = getenv('ADMIN_ALERT_EMAIL') ?: '';
@@ -49,126 +50,108 @@ function trackApiFailure(): void
                     "BharatPe API failed {$count} times in the last " . BHARATPE_FAIL_WINDOW_MIN . " minutes.\n\nTimestamp: " . date('Y-m-d H:i:s')
                 );
             }
-            logBharatPe('alert_sent', ['failures' => $count, 'window_min' => BHARATPE_FAIL_WINDOW_MIN]);
+            logBharatPe('alert_sent', ['failures' => $count]);
         }
-    } catch (Throwable) {
-        // Never let alert tracking crash the main flow
-    }
+    } catch (Throwable) {}
 }
 
-// ── Fraud detection ──────────────────────────────────────────────────────────
-
-function markUserSuspicious(int $userId): void
+// ── Fraud detection ───────────────────────────────────────────
+function markUserSuspicious(string $userId): void
 {
     try {
-        getDB()->prepare(
-            'UPDATE users SET is_suspicious = 1 WHERE id = ?'
-        )->execute([$userId]);
+        getDB()->users->updateOne(
+            ['_id' => new ObjectId($userId)],
+            ['$set' => ['is_suspicious' => true]]
+        );
         logBharatPe('user_flagged_suspicious', ['user_id' => $userId]);
     } catch (Throwable) {}
 }
 
-function isUserSuspicious(int $userId): bool
+function isUserSuspicious(string $userId): bool
 {
-    $stmt = getDB()->prepare(
-        'SELECT is_suspicious FROM users WHERE id = ? LIMIT 1'
-    );
-    $stmt->execute([$userId]);
-    return (bool)$stmt->fetchColumn();
+    try {
+        $user = getDB()->users->findOne(
+            ['_id' => new ObjectId($userId)],
+            ['projection' => ['is_suspicious' => 1]]
+        );
+        return !empty($user['is_suspicious']);
+    } catch (Throwable) {
+        return false;
+    }
 }
 
-/**
- * Returns the total amount of successful payments by a user today (UTC).
- */
-function getUserDailyTotal(int $userId): float
+function getUserDailyTotal(string $userId): float
 {
-    $stmt = getDB()->prepare(
-        "SELECT COALESCE(SUM(amount), 0)
-         FROM payments
-         WHERE user_id = ? AND status = 'success' AND DATE(created_at) = CURDATE()"
-    );
-    $stmt->execute([$userId]);
-    return round((float)$stmt->fetchColumn(), 2);
+    try {
+        $start  = new UTCDateTime(strtotime('today 00:00:00 UTC') * 1000);
+        $end    = new UTCDateTime(strtotime('tomorrow 00:00:00 UTC') * 1000);
+        $result = getDB()->payments->aggregate([
+            ['$match' => [
+                'user_id'    => $userId,
+                'status'     => 'success',
+                'created_at' => ['$gte' => $start, '$lt' => $end],
+            ]],
+            ['$group' => ['_id' => null, 'total' => ['$sum' => '$amount']]],
+        ])->toArray();
+        return round((float)($result[0]['total'] ?? 0), 2);
+    } catch (Throwable) {
+        return 0.0;
+    }
 }
 
-/**
- * Track amount-mismatch fraud attempts per user+UTR.
- * After 3 mismatches the user is flagged suspicious.
- */
-function trackMismatchAttempt(int $userId, string $utr): void
+function trackMismatchAttempt(string $userId, string $utr): void
 {
-    if ($userId === 0) return;
-
+    if ($userId === '') return;
     try {
         $identifier = "user:{$userId}:utr:{$utr}";
+        $cutoff     = new UTCDateTime((time() - 30 * 60) * 1000);
+        $db         = getDB();
 
-        getDB()->prepare(
-            "INSERT INTO rate_limits (ip, action, identifier) VALUES ('system', 'amount_mismatch', ?)"
-        )->execute([$identifier]);
+        $db->rate_limits->insertOne([
+            'ip'         => 'system',
+            'action'     => 'amount_mismatch',
+            'identifier' => $identifier,
+            'created_at' => new UTCDateTime(),
+        ]);
 
-        $stmt = getDB()->prepare(
-            "SELECT COUNT(*) FROM rate_limits
-             WHERE action = 'amount_mismatch' AND identifier = ?
-             AND created_at > DATE_SUB(NOW(), INTERVAL 30 MINUTE)"
-        );
-        $stmt->execute([$identifier]);
+        $count = $db->rate_limits->countDocuments([
+            'action'     => 'amount_mismatch',
+            'identifier' => $identifier,
+            'created_at' => ['$gt' => $cutoff],
+        ]);
 
-        if ((int)$stmt->fetchColumn() >= 3) {
+        if ($count >= 3) {
             markUserSuspicious($userId);
         }
     } catch (Throwable) {}
 }
 
-// ── Auto-expire stale pending payments ───────────────────────────────────────
-function expireStalePendingPayment(int $paymentId, string $createdAt): bool
+// ── Auto-expire stale pending payments ────────────────────────
+function expireStalePendingPayment(string $paymentId, $createdAt): bool
 {
-    if ((time() - strtotime($createdAt)) < PAYMENT_STALE_SECONDS) {
-        return false;
-    }
+    $ts = ($createdAt instanceof UTCDateTime)
+        ? $createdAt->toDateTime()->getTimestamp()
+        : strtotime((string)$createdAt);
 
-    $stmt = getDB()->prepare(
-        "UPDATE payments SET status = 'failed' WHERE id = ? AND status = 'pending'"
+    if ((time() - $ts) < PAYMENT_STALE_SECONDS) return false;
+
+    $result = getDB()->payments->updateOne(
+        ['_id' => new ObjectId($paymentId), 'status' => 'pending'],
+        ['$set' => ['status' => 'failed']]
     );
-    $stmt->execute([$paymentId]);
 
-    if ($stmt->rowCount() > 0) {
+    if ($result->getModifiedCount() > 0) {
         logBharatPe('payment_expired', ['payment_id' => $paymentId]);
         return true;
     }
-
     return false;
 }
 
-/**
- * Verify a UPI payment against the BharatPe merchant transaction API.
- *
- * API response shape expected:
- *   { "status": true, "data": { "transactions": [ { ... } ] } }
- *
- * UTR field used: bankReferenceNo  (NOT internalUtr, NOT id)
- *
- * Env vars required:
- *   BHARATPE_API_URL   — full endpoint URL
- *   BHARATPE_TOKEN     — bearer token from merchant dashboard
- *
- * Optional:
- *   BHARATPE_TEST_MODE — set "true" to bypass API during local dev
- *
- * @param  string $utr    bankReferenceNo submitted by the user.
- * @param  float  $amount Amount submitted by the user (rounded to 2 dp).
- * @return bool   true only when a fresh, matching SUCCESS/PAYMENT_RECV transaction exists.
- */
-/**
- * Returns:
- *   true  — payment verified
- *   false — payment not found / rejected
- *   null  — API unreachable, caller should treat as pending and retry
- */
-function verifyWithBharatPe(string $utr, float $amount, int $userId = 0): bool|null
+// ── BharatPe verification ─────────────────────────────────────
+function verifyWithBharatPe(string $utr, float $amount, string $userId = '')
 {
-    $amount = round($amount, 2); // normalise once at entry point
+    $amount = round($amount, 2);
 
-    // ── Test mode bypass ──────────────────────────────────────
     if (getenv('BHARATPE_TEST_MODE') === 'true') {
         return true;
     }
@@ -177,16 +160,11 @@ function verifyWithBharatPe(string $utr, float $amount, int $userId = 0): bool|n
     $apiUrl = trim((string)(getenv('BHARATPE_API_URL') ?: ''));
 
     if ($token === '' || $apiUrl === '') {
-        error_log('[BharatPe] BHARATPE_TOKEN or BHARATPE_API_URL not set — aborting.');
+        error_log('[BharatPe] BHARATPE_TOKEN or BHARATPE_API_URL not set.');
         return null;
     }
 
-    $headers = [
-        'token: ' . $token,
-        'accept: application/json',
-    ];
-
-    // ── cURL with retry (max 2 attempts, 5 s timeout each) ───
+    $headers  = ['token: ' . $token, 'accept: application/json'];
     $response = null;
 
     for ($attempt = 1; $attempt <= BHARATPE_MAX_RETRIES; $attempt++) {
@@ -200,7 +178,6 @@ function verifyWithBharatPe(string $utr, float $amount, int $userId = 0): bool|n
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
         ]);
-
         $raw      = curl_exec($ch);
         $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $curlErr  = curl_error($ch);
@@ -211,48 +188,30 @@ function verifyWithBharatPe(string $utr, float $amount, int $userId = 0): bool|n
             break;
         }
 
-        logBharatPe('api_attempt_failed', [
-            'attempt'  => $attempt,
-            'http'     => $httpCode,
-            'curl_err' => $curlErr,
-            'utr'      => $utr,
-        ]);
-
-        if ($attempt < BHARATPE_MAX_RETRIES) {
-            usleep(300_000);
-        }
+        logBharatPe('api_attempt_failed', ['attempt' => $attempt, 'http' => $httpCode, 'curl_err' => $curlErr]);
+        if ($attempt < BHARATPE_MAX_RETRIES) usleep(300_000);
     }
 
-    // API unreachable → track failure + return null so payment stays pending
     if ($response === null) {
-        logBharatPe('api_unreachable', ['utr' => $utr, 'retries' => BHARATPE_MAX_RETRIES]);
+        logBharatPe('api_unreachable', ['utr' => $utr]);
         trackApiFailure();
         return null;
     }
 
-    // ── Decode & validate structure ───────────────────────────
     $body = json_decode($response, true);
 
-    if (!is_array($body)) {
-        logBharatPe('invalid_json', ['utr' => $utr]);
-        trackApiFailure();
-        return null;
-    }
-
-    if (($body['status'] ?? null) !== true) {
-        logBharatPe('api_status_false', ['utr' => $utr, 'body' => substr($response, 0, 200)]);
+    if (!is_array($body) || ($body['status'] ?? null) !== true) {
+        logBharatPe('api_bad_response', ['utr' => $utr]);
         trackApiFailure();
         return null;
     }
 
     $transactions = $body['data']['transactions'] ?? null;
-
     if (!is_array($transactions) || empty($transactions)) {
         logBharatPe('no_transactions', ['utr' => $utr]);
         return false;
     }
 
-    // ── Sort newest-first so freshest match wins ──────────────
     usort($transactions, fn($a, $b) =>
         ($b['paymentTimestamp'] ?? 0) <=> ($a['paymentTimestamp'] ?? 0)
     );
@@ -269,34 +228,24 @@ function verifyWithBharatPe(string $utr, float $amount, int $userId = 0): bool|n
         $apiUtr = preg_replace('/\s+/', '', strtolower((string)($txn['bankReferenceNo'] ?? '')));
         if ($apiUtr === '' || $apiUtr !== $userUtr)    continue;
 
-        // round() both sides eliminates float representation drift (₹100 vs ₹100.0000001)
         $apiAmount = round((float)($txn['amount'] ?? 0), 2);
         if ($apiAmount <= 0)                           continue;
 
         if (abs($apiAmount - $amount) >= 0.01) {
-            logBharatPe('amount_mismatch', [
-                'utr'      => $utr,
-                'expected' => $amount,
-                'got'      => $apiAmount,
-                'user_id'  => $userId,
-            ]);
+            logBharatPe('amount_mismatch', ['utr' => $utr, 'expected' => $amount, 'got' => $apiAmount]);
             trackMismatchAttempt($userId, $utr);
             continue;
         }
 
-        // abs() covers both past timestamps AND slight server clock drift forward
         $txnTime = intval($txn['paymentTimestamp'] ?? 0) / 1000;
         if (abs(time() - $txnTime) > 1800) {
-            logBharatPe('stale_transaction', ['utr' => $utr, 'age_sec' => abs(time() - $txnTime)]);
+            logBharatPe('stale_transaction', ['utr' => $utr]);
             continue;
         }
 
         // Duplicate credit guard
-        $stmt = getDB()->prepare(
-            "SELECT id FROM payments WHERE utr = ? AND status = 'success' LIMIT 1"
-        );
-        $stmt->execute([$utr]);
-        if ($stmt->fetch()) {
+        $existing = getDB()->payments->findOne(['utr' => $utr, 'status' => 'success']);
+        if ($existing) {
             logBharatPe('already_credited', ['utr' => $utr]);
             return false;
         }
@@ -309,198 +258,157 @@ function verifyWithBharatPe(string $utr, float $amount, int $userId = 0): bool|n
     return false;
 }
 
-/**
- * Validate and sanitize the incoming payment payload.
- *
- * @param  array $input  Raw $_POST or json-decoded body.
- * @return array{utr:string, amount:float, user_id:int}
- * @throws InvalidArgumentException on validation failure.
- */
+// ── Payment input validation ──────────────────────────────────
 function validatePaymentInput(array $input): array
 {
-    $utr     = trim((string)($input['utr']     ?? ''));
-    $amount  = $input['amount']  ?? null;
-    $userId  = $input['user_id'] ?? null;
+    $utr    = trim((string)($input['utr']     ?? ''));
+    $amount = $input['amount']  ?? null;
+    $userId = $input['user_id'] ?? null;
 
     if ($utr === '' || !preg_match('/^[A-Za-z0-9]{8,64}$/', $utr)) {
         throw new InvalidArgumentException('Invalid UTR format.');
     }
-
     if ($amount === null || !is_numeric($amount) || (float)$amount <= 0) {
         throw new InvalidArgumentException('Amount must be a positive number.');
     }
-
-    if ($userId === null || !filter_var($userId, FILTER_VALIDATE_INT) || (int)$userId < 1) {
-        throw new InvalidArgumentException('Invalid user_id.');
+    if (empty($userId) || !is_string($userId)) {
+        throw new InvalidArgumentException('Invalid user session.');
     }
 
     return [
         'utr'     => strtoupper($utr),
         'amount'  => round((float)$amount, 2),
-        'user_id' => (int)$userId,
+        'user_id' => $userId,
     ];
 }
 
-/**
- * Insert a new payment record with status = pending.
- *
- * Uses a DB transaction + SELECT FOR UPDATE so two simultaneous requests
- * with the same UTR cannot both pass the duplicate check (race condition).
- *
- * @throws RuntimeException if the UTR already exists.
- * @return int Inserted payment ID.
- */
-function insertPendingPayment(int $userId, string $utr, float $amount): int
+// ── Insert pending payment (unique index blocks duplicate UTR) ─
+function insertPendingPayment(string $userId, string $utr, float $amount): string
 {
-    $db = getDB();
-    $db->beginTransaction();
-
     try {
-        // FOR UPDATE locks the row (or the gap) — second concurrent request blocks here
-        // until this transaction commits, then sees the row and throws duplicate error.
-        $stmt = $db->prepare(
-            'SELECT id FROM payments WHERE utr = ? LIMIT 1 FOR UPDATE'
-        );
-        $stmt->execute([$utr]);
-
-        if ($stmt->fetch()) {
-            $db->rollBack();
-            throw new RuntimeException('Duplicate UTR: this transaction has already been submitted.');
+        $result = getDB()->payments->insertOne([
+            'user_id'         => $userId,
+            'utr'             => $utr,
+            'amount'          => $amount,
+            'status'          => 'pending',
+            'last_checked_at' => null,
+            'created_at'      => new UTCDateTime(),
+        ]);
+        return (string)$result->getInsertedId();
+    } catch (MongoDB\Driver\Exception\BulkWriteException $e) {
+        if ($e->getCode() === 11000) {
+            throw new RuntimeException('This UTR has already been submitted.');
         }
-
-        $stmt = $db->prepare(
-            'INSERT INTO payments (user_id, utr, amount, status) VALUES (?, ?, ?, ?)'
-        );
-        $stmt->execute([$userId, $utr, $amount, 'pending']);
-        $id = (int)$db->lastInsertId();
-
-        $db->commit();
-        return $id;
-
-    } catch (RuntimeException $e) {
-        throw $e; // already rolled back above
-    } catch (Throwable $e) {
-        $db->rollBack();
         throw $e;
     }
 }
 
-/**
- * Finalise a payment: update status and credit wallet on success.
- *
- * The UPDATE uses `AND status != 'success'` so a duplicate call
- * (race condition, API retry, double click) affects 0 rows — and
- * rowCount() === 0 means the wallet credit is skipped entirely.
- * This makes the function safe to call more than once for the same payment.
- */
-function finalisePayment(int $paymentId, int $userId, float $amount, bool $success): void
+// ── Finalise payment + credit wallet ─────────────────────────
+function finalisePayment(string $paymentId, string $userId, float $amount, bool $success): void
 {
     $db     = getDB();
     $status = $success ? 'success' : 'failed';
 
-    $db->beginTransaction();
-    try {
-        // Only update if not already finalised — prevents double credit
-        $stmt = $db->prepare(
-            "UPDATE payments SET status = ? WHERE id = ? AND status != 'success'"
+    $result = $db->payments->updateOne(
+        ['_id' => new ObjectId($paymentId), 'status' => ['$ne' => 'success']],
+        ['$set' => ['status' => $status]]
+    );
+
+    if ($success && $result->getModifiedCount() === 1) {
+        $db->users->updateOne(
+            ['_id' => new ObjectId($userId)],
+            ['$inc' => ['balance' => round($amount, 2)]]
         );
-        $stmt->execute([$status, $paymentId]);
-
-        // rowCount() === 0 means payment was already marked success by a concurrent request
-        if ($success && $stmt->rowCount() === 1) {
-            $db->prepare(
-                'UPDATE users SET balance = balance + ? WHERE id = ?'
-            )->execute([round($amount, 2), $userId]);
-        }
-
-        $db->commit();
-    } catch (Throwable $e) {
-        $db->rollBack();
-        throw $e;
     }
 }
 
-/**
- * Fetch aggregate stats for the admin dashboard.
- */
+// ── Admin dashboard stats ─────────────────────────────────────
 function getDashboardStats(): array
 {
-    $db = getDB();
+    try {
+        $result = getDB()->payments->aggregate([
+            ['$group' => [
+                '_id'     => null,
+                'total'   => ['$sum' => 1],
+                'success' => ['$sum' => ['$cond' => [['$eq' => ['$status', 'success']], 1, 0]]],
+                'failed'  => ['$sum' => ['$cond' => [['$eq' => ['$status', 'failed']],  1, 0]]],
+                'pending' => ['$sum' => ['$cond' => [['$eq' => ['$status', 'pending']], 1, 0]]],
+                'revenue' => ['$sum' => ['$cond' => [['$eq' => ['$status', 'success']], '$amount', 0]]],
+            ]],
+        ])->toArray();
 
-    $row = $db->query(
-        "SELECT
-            COUNT(*)                                        AS total,
-            SUM(status = 'success')                         AS success,
-            SUM(status = 'failed')                          AS failed,
-            SUM(status = 'pending')                         AS pending,
-            COALESCE(SUM(CASE WHEN status='success' THEN amount END), 0) AS revenue
-         FROM payments"
-    )->fetch();
+        if (empty($result)) {
+            return ['total' => 0, 'success' => 0, 'failed' => 0, 'pending' => 0, 'revenue' => 0.0];
+        }
 
-    return [
-        'total'   => (int)$row['total'],
-        'success' => (int)$row['success'],
-        'failed'  => (int)$row['failed'],
-        'pending' => (int)$row['pending'],
-        'revenue' => (float)$row['revenue'],
-    ];
+        $r = $result[0];
+        return [
+            'total'   => (int)$r['total'],
+            'success' => (int)$r['success'],
+            'failed'  => (int)$r['failed'],
+            'pending' => (int)$r['pending'],
+            'revenue' => (float)$r['revenue'],
+        ];
+    } catch (Throwable) {
+        return ['total' => 0, 'success' => 0, 'failed' => 0, 'pending' => 0, 'revenue' => 0.0];
+    }
 }
 
-/**
- * Fetch paginated payment rows for the admin payments table.
- *
- * @param  string $statusFilter  '' | 'pending' | 'success' | 'failed'
- * @param  string $utrSearch     Partial UTR to search.
- * @param  int    $limit
- * @param  int    $offset
- * @return array{rows: array, total: int}
- */
+// ── Paginated payments list ───────────────────────────────────
 function getPaymentsPage(
     string $statusFilter = '',
-    string $utrSearch = '',
-    int $limit = 25,
-    int $offset = 0
+    string $utrSearch    = '',
+    int    $limit        = 25,
+    int    $offset       = 0
 ): array {
     $db     = getDB();
-    $where  = [];
-    $params = [];
+    $filter = [];
 
     if (in_array($statusFilter, ['pending', 'success', 'failed'], true)) {
-        $where[]  = 'p.status = ?';
-        $params[] = $statusFilter;
+        $filter['status'] = $statusFilter;
     }
-
     if ($utrSearch !== '') {
-        $where[]  = 'p.utr LIKE ?';
-        $params[] = '%' . $utrSearch . '%';
+        $filter['utr'] = ['$regex' => $utrSearch, '$options' => 'i'];
     }
 
-    $whereSQL = $where ? ('WHERE ' . implode(' AND ', $where)) : '';
+    $total  = $db->payments->countDocuments($filter);
+    $cursor = $db->payments->find($filter, [
+        'sort'  => ['created_at' => -1],
+        'skip'  => $offset,
+        'limit' => $limit,
+    ]);
 
-    $countStmt = $db->prepare("SELECT COUNT(*) FROM payments p {$whereSQL}");
-    $countStmt->execute($params);
-    $total = (int)$countStmt->fetchColumn();
+    $rows = [];
+    foreach ($cursor as $doc) {
+        $userName = '—';
+        try {
+            $user = $db->users->findOne(
+                ['_id' => new ObjectId($doc['user_id'])],
+                ['projection' => ['name' => 1]]
+            );
+            if ($user) $userName = (string)$user['name'];
+        } catch (Throwable) {}
 
-    $params[] = $limit;
-    $params[] = $offset;
+        $createdAt = ($doc['created_at'] instanceof UTCDateTime)
+            ? $doc['created_at']->toDateTime()->format('Y-m-d H:i:s')
+            : (string)($doc['created_at'] ?? '');
 
-    $stmt = $db->prepare(
-        "SELECT p.id, p.user_id, u.name AS user_name, p.utr, p.amount, p.status, p.created_at
-         FROM payments p
-         LEFT JOIN users u ON u.id = p.user_id
-         {$whereSQL}
-         ORDER BY p.created_at DESC
-         LIMIT ? OFFSET ?"
-    );
-    $stmt->execute($params);
+        $rows[] = [
+            'id'         => (string)$doc['_id'],
+            'user_id'    => (string)($doc['user_id'] ?? ''),
+            'user_name'  => $userName,
+            'utr'        => (string)$doc['utr'],
+            'amount'     => (float)$doc['amount'],
+            'status'     => (string)$doc['status'],
+            'created_at' => $createdAt,
+        ];
+    }
 
-    return ['rows' => $stmt->fetchAll(), 'total' => $total];
+    return ['rows' => $rows, 'total' => (int)$total];
 }
 
-/**
- * Return a JSON response and terminate.
- */
-function jsonResponse(int $httpCode, array $body): never
+// ── JSON response helper ──────────────────────────────────────
+function jsonResponse(int $httpCode, array $body): void
 {
     http_response_code($httpCode);
     header('Content-Type: application/json');
@@ -508,84 +416,42 @@ function jsonResponse(int $httpCode, array $body): never
     exit;
 }
 
-// ============================================================
-// Rate limiting
-// ============================================================
-
-/**
- * Check if an action is within the allowed rate limit, and record the attempt.
- *
- * Two axes are checked independently:
- *   1. IP address — prevents a single machine from spamming.
- *   2. identifier  — prevents distributed attacks against a specific target
- *                    (e.g. same email from many IPs, same UTR from many IPs).
- *
- * @param string $action      Short key, e.g. 'login', 'verify_payment'.
- * @param int    $limit       Max allowed attempts in the window.
- * @param int    $seconds     Window size in seconds.
- * @param string $identifier  Optional secondary key (email, UTR, …).
- * @param int    $idLimit     Max allowed attempts per identifier (default = $limit).
- *
- * @return bool  true = allowed, false = blocked.
- */
+// ── Rate limiting ─────────────────────────────────────────────
 function checkRateLimit(
     string $action,
-    int    $limit   = 5,
-    int    $seconds = 60,
+    int    $limit      = 5,
+    int    $seconds    = 60,
     string $identifier = '',
     int    $idLimit    = 0
 ): bool {
-    $db = getDB();
-    $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+    $db  = getDB();
+    $ip  = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+    if ($idLimit === 0) $idLimit = $limit;
 
-    if ($idLimit === 0) {
-        $idLimit = $limit;
-    }
+    $cutoff = new UTCDateTime((time() - $seconds) * 1000);
 
-    $cutoff = date('Y-m-d H:i:s', time() - $seconds);
+    $count = $db->rate_limits->countDocuments([
+        'ip' => $ip, 'action' => $action, 'created_at' => ['$gt' => $cutoff],
+    ]);
+    if ($count >= $limit) return false;
 
-    // ── 1. Check by IP ────────────────────────────────────────
-    $stmt = $db->prepare(
-        'SELECT COUNT(*) FROM rate_limits
-         WHERE ip = ? AND action = ? AND created_at > ?'
-    );
-    $stmt->execute([$ip, $action, $cutoff]);
-
-    if ((int)$stmt->fetchColumn() >= $limit) {
-        return false;
-    }
-
-    // ── 2. Check by identifier (if provided) ─────────────────
     if ($identifier !== '') {
-        $stmt = $db->prepare(
-            'SELECT COUNT(*) FROM rate_limits
-             WHERE action = ? AND identifier = ? AND created_at > ?'
-        );
-        $stmt->execute([$action, $identifier, $cutoff]);
-
-        if ((int)$stmt->fetchColumn() >= $idLimit) {
-            return false;
-        }
+        $count = $db->rate_limits->countDocuments([
+            'action' => $action, 'identifier' => $identifier, 'created_at' => ['$gt' => $cutoff],
+        ]);
+        if ($count >= $idLimit) return false;
     }
 
-    // ── 3. Record this attempt ────────────────────────────────
-    $db->prepare(
-        'INSERT INTO rate_limits (ip, action, identifier) VALUES (?, ?, ?)'
-    )->execute([$ip, $action, $identifier]);
-
-    // ── 4. Probabilistic cleanup (1% chance) — keeps table small ──
-    if (random_int(1, 100) === 1) {
-        $db->prepare(
-            "DELETE FROM rate_limits WHERE created_at < DATE_SUB(NOW(), INTERVAL 1 DAY)"
-        )->execute();
-    }
+    $db->rate_limits->insertOne([
+        'ip'         => $ip,
+        'action'     => $action,
+        'identifier' => $identifier,
+        'created_at' => new UTCDateTime(),
+    ]);
 
     return true;
 }
 
-/**
- * Terminate with a 429 JSON response if the rate limit is exceeded.
- */
 function enforceRateLimit(
     string $action,
     int    $limit      = 5,
@@ -594,109 +460,23 @@ function enforceRateLimit(
     int    $idLimit    = 0
 ): void {
     if (!checkRateLimit($action, $limit, $seconds, $identifier, $idLimit)) {
-        jsonResponse(429, [
-            'status'  => 'error',
-            'message' => 'Too many attempts. Please wait a moment and try again.',
-        ]);
+        jsonResponse(429, ['status' => 'error', 'message' => 'Too many attempts. Please wait.']);
     }
 }
 
-// ============================================================
-// User auth functions
-// ============================================================
-
-/**
- * Register a new user. Returns the new user's ID.
- *
- * @throws InvalidArgumentException on bad input.
- * @throws RuntimeException if email already exists.
- */
-function registerUser(string $name, string $email, string $password): int
-{
-    $name  = trim($name);
-    $email = strtolower(trim($email));
-
-    if ($name === '' || mb_strlen($name) > 100) {
-        throw new InvalidArgumentException('Name must be 1–100 characters.');
-    }
-
-    if (!filter_var($email, FILTER_VALIDATE_EMAIL) || mb_strlen($email) > 191) {
-        throw new InvalidArgumentException('Invalid email address.');
-    }
-
-    if (mb_strlen($password) < 8) {
-        throw new InvalidArgumentException('Password must be at least 8 characters.');
-    }
-
-    $db   = getDB();
-    $stmt = $db->prepare('SELECT id FROM users WHERE email = ? LIMIT 1');
-    $stmt->execute([$email]);
-
-    if ($stmt->fetch()) {
-        throw new RuntimeException('An account with this email already exists.');
-    }
-
-    $hash = password_hash($password, PASSWORD_BCRYPT);
-
-    $stmt = $db->prepare(
-        'INSERT INTO users (name, email, password, balance) VALUES (?, ?, ?, 0.00)'
-    );
-    $stmt->execute([$name, $email, $hash]);
-
-    return (int)$db->lastInsertId();
-}
-
-/**
- * Verify credentials and return the user row, or false on failure.
- *
- * @return array{id:int, name:string, email:string, balance:float}|false
- */
-function loginUser(string $email, string $password): array|false
-{
-    $email = strtolower(trim($email));
-
-    if ($email === '' || $password === '') {
-        return false;
-    }
-
-    $db   = getDB();
-    $stmt = $db->prepare(
-        'SELECT id, name, email, password, balance FROM users WHERE email = ? LIMIT 1'
-    );
-    $stmt->execute([$email]);
-    $user = $stmt->fetch();
-
-    if (!$user || !password_verify($password, $user['password'])) {
-        return false;
-    }
-
-    return [
-        'id'      => (int)$user['id'],
-        'name'    => $user['name'],
-        'email'   => $user['email'],
-        'balance' => (float)$user['balance'],
-    ];
-}
-
-/**
- * Start session (if not already started).
- */
+// ── Session helpers ───────────────────────────────────────────
 function startSession(): void
 {
     if (session_status() === PHP_SESSION_NONE) {
         session_start([
             'cookie_httponly' => true,
-            'cookie_secure'   => true,   // only send over HTTPS
+            'cookie_secure'   => true,
             'cookie_samesite' => 'Strict',
             'use_strict_mode' => true,
         ]);
     }
 }
 
-/**
- * Return (and lazily create) the CSRF token for the current session.
- * Always call startSession() before this.
- */
 function csrfToken(): string
 {
     if (empty($_SESSION['csrf_token'])) {
@@ -705,48 +485,31 @@ function csrfToken(): string
     return $_SESSION['csrf_token'];
 }
 
-/**
- * Validate the CSRF token from POST or X-CSRF-Token header.
- * Terminates with 403 on failure.
- */
 function verifyCsrf(): void
 {
-    $submitted = $_POST['csrf_token']
-        ?? $_SERVER['HTTP_X_CSRF_TOKEN']
-        ?? '';
-
-    $expected = $_SESSION['csrf_token'] ?? '';
+    $submitted = $_POST['csrf_token'] ?? $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
+    $expected  = $_SESSION['csrf_token'] ?? '';
 
     if ($expected === '' || !hash_equals($expected, $submitted)) {
         http_response_code(403);
-        // JSON or HTML response based on Accept header
-        if (str_contains($_SERVER['HTTP_ACCEPT'] ?? '', 'application/json')) {
+        if (strpos($_SERVER['HTTP_ACCEPT'] ?? '', 'application/json') !== false) {
             header('Content-Type: application/json');
             echo json_encode(['status' => 'error', 'message' => 'Invalid CSRF token.']);
         } else {
-            echo 'Invalid or expired form submission. Please go back and try again.';
+            echo 'Invalid form submission. Please go back and try again.';
         }
         exit;
     }
 }
 
-/**
- * Return the logged-in user's ID from session, or null if not logged in.
- */
-function getSessionUserId(): ?int
+function getSessionUserId(): ?string
 {
     startSession();
     $id = $_SESSION['user_id'] ?? null;
-    return is_int($id) && $id > 0 ? $id : null;
+    return (is_string($id) && strlen($id) === 24) ? $id : null;
 }
 
-/**
- * Require a logged-in user session for JSON API endpoints.
- * Terminates with 401 if not authenticated.
- *
- * @return int Authenticated user ID.
- */
-function requireUserSession(): int
+function requireUserSession(): string
 {
     $userId = getSessionUserId();
     if ($userId === null) {
@@ -755,12 +518,15 @@ function requireUserSession(): int
     return $userId;
 }
 
-/**
- * Fetch a user's current balance.
- */
-function getUserBalance(int $userId): float
+function getUserBalance(string $userId): float
 {
-    $stmt = getDB()->prepare('SELECT balance FROM users WHERE id = ? LIMIT 1');
-    $stmt->execute([$userId]);
-    return (float)($stmt->fetchColumn() ?: 0);
+    try {
+        $user = getDB()->users->findOne(
+            ['_id' => new ObjectId($userId)],
+            ['projection' => ['balance' => 1]]
+        );
+        return round((float)($user['balance'] ?? 0), 2);
+    } catch (Throwable) {
+        return 0.0;
+    }
 }

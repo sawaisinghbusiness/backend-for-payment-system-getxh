@@ -368,15 +368,15 @@ function statusBadge(string $status): string
       </thead>
       <tbody>
         <?php foreach ($rows as $row): ?>
-        <tr id="row-<?= (int)$row['id'] ?>">
-          <td class="id-cell"><?= (int)$row['id'] ?></td>
+        <?php $rid = htmlspecialchars($row['id']); ?>
+        <tr id="row-<?= $rid ?>">
+          <td class="id-cell" style="font-size:.72rem;"><?= substr($rid, -8) ?></td>
           <td>
             <div style="font-weight:500;"><?= htmlspecialchars($row['user_name'] ?? '—') ?></div>
-            <div style="font-size:.78rem;color:var(--muted);">ID <?= (int)$row['user_id'] ?></div>
           </td>
           <td class="utr-cell"><?= htmlspecialchars($row['utr']) ?></td>
           <td class="amount-cell">₹<?= number_format((float)$row['amount'], 2) ?></td>
-          <td id="status-<?= (int)$row['id'] ?>"><?= statusBadge($row['status']) ?></td>
+          <td id="status-<?= $rid ?>"><?= statusBadge($row['status']) ?></td>
           <td style="color:var(--muted);white-space:nowrap;">
             <?= htmlspecialchars(date('d M Y, H:i', strtotime($row['created_at']))) ?>
           </td>
@@ -384,11 +384,11 @@ function statusBadge(string $status): string
             <?php if ($row['status'] === 'pending'): ?>
               <button
                 class="action-btn approve-btn"
-                onclick="adminAction(<?= (int)$row['id'] ?>, 'approve')"
+                onclick="adminAction('<?= $rid ?>', 'approve')"
               >✓ Approve</button>
               <button
                 class="action-btn reject-btn"
-                onclick="adminAction(<?= (int)$row['id'] ?>, 'reject')"
+                onclick="adminAction('<?= $rid ?>', 'reject')"
               >✗ Reject</button>
             <?php else: ?>
               <span style="color:var(--muted);font-size:.78rem;">—</span>

@@ -1,35 +1,30 @@
 <?php
-// ============================================================
-// bootstrap.php — loads .env into environment variables
-// Requires: composer install (vlucas/phpdotenv)
-// ============================================================
-
 declare(strict_types=1);
 
-// ── Production error handling ─────────────────────────────────
-// Never display errors to users — log everything, show nothing.
-ini_set('display_errors', '0');
-ini_set('display_startup_errors', '0');
+ini_set('display_errors', '1');
+ini_set('display_startup_errors', '1');
 error_reporting(E_ALL);
 ini_set('log_errors', '1');
 
-$autoloader = __DIR__ . '/vendor/autoload.php';
-
-if (!file_exists($autoloader)) {
-    // Composer not installed yet — fail clearly
-    http_response_code(500);
-    error_log('[bootstrap] vendor/autoload.php not found. Run: composer install');
-    die('Server configuration error. Please contact the administrator.');
+// Composer autoload (built by Docker during image build)
+$autoload = __DIR__ . '/vendor/autoload.php';
+if (file_exists($autoload)) {
+    require_once $autoload;
 }
 
-require_once $autoloader;
-
-$dotenv = Dotenv\Dotenv::createImmutable(__DIR__);
-$dotenv->safeLoad(); // safeLoad: no error if .env file is missing (uses server env vars)
-
-// Validate that critical variables are present
-$dotenv->required([
-    'DB_HOST',
-    'DB_NAME',
-    'DB_USER',
-])->notEmpty();
+// Load .env manually (Render uses dashboard env vars, .env is for local dev)
+$envFile = __DIR__ . '/.env';
+if (file_exists($envFile)) {
+    $lines = file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if ($line === '' || $line[0] === '#' || strpos($line, '=') === false) continue;
+        [$key, $val] = explode('=', $line, 2);
+        $key = trim($key);
+        $val = trim($val);
+        if (getenv($key) === false) {
+            putenv("{$key}={$val}");
+            $_ENV[$key] = $val;
+        }
+    }
+}

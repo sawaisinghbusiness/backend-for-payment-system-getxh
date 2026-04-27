@@ -1,0 +1,11 @@
+# ── Basic Auth ──────────────────────────────────────────────────
+AuthType Basic
+AuthName "Admin Panel"
+AuthUserFile /var/www/html/.htpasswd
+Require valid-user
+
+# ── Optional: uncomment and set your server IP for extra layer ──
+# <RequireAll>
+#   Require valid-user
+#   Require ip 123.123.123.123
+# </RequireAll>

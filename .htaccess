@@ -1,16 +1,13 @@
-# ── Force HTTPS ───────────────────────────────────────────────
 <IfModule mod_rewrite.c>
     RewriteEngine On
     RewriteCond %{HTTPS} off
     RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
 </IfModule>
 
-# ── Block direct access to sensitive files ────────────────────
-<FilesMatch "^(\.env.*|composer\.(json|lock)|bootstrap\.php|db\.php|functions\.php|pay\.html)$">
+<FilesMatch "^(\.env.*|composer\.(json|lock)|bootstrap\.php|db\.php|functions\.php|Dockerfile|backup\.sh|migrate\.sql)$">
     Require all denied
 </FilesMatch>
 
-# ── Security headers ──────────────────────────────────────────
 <IfModule mod_headers.c>
     Header always set X-Content-Type-Options "nosniff"
     Header always set X-Frame-Options "DENY"
