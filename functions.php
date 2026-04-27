@@ -468,9 +468,12 @@ function enforceRateLimit(
 function startSession(): void
 {
     if (session_status() === PHP_SESSION_NONE) {
+        $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+            || ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https';
+
         session_start([
             'cookie_httponly' => true,
-            'cookie_secure'   => true,
+            'cookie_secure'   => $isHttps,
             'cookie_samesite' => 'Strict',
             'use_strict_mode' => true,
         ]);
