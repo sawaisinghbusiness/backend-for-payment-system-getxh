@@ -3,6 +3,14 @@ declare(strict_types=1);
 
 header('Content-Type: application/json');
 header('X-Content-Type-Options: nosniff');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: POST, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(204);
+    exit;
+}
 
 require_once __DIR__ . '/functions.php';
 
@@ -10,63 +18,52 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     jsonResponse(405, ['status' => 'error', 'message' => 'Method not allowed.']);
 }
 
-$userId = requireUserSession();
+// ── Parse input ───────────────────────────────────────────────
+$input = json_decode(file_get_contents('php://input'), true) ?? [];
+if (empty($input)) $input = $_POST;
 
-verifyCsrf();
+$utr    = strtoupper(trim(preg_replace('/[^A-Za-z0-9]/', '', $input['utr'] ?? '')));
+$amount = round((float)($input['amount'] ?? 0), 2);
 
-enforceRateLimit('verify_payment', 3, 60);
-
-if (isUserSuspicious($userId)) {
-    jsonResponse(403, ['status' => 'error', 'message' => 'Account temporarily restricted. Please contact support.']);
+if (strlen($utr) < 8 || strlen($utr) > 64) {
+    jsonResponse(400, ['status' => 'error', 'message' => 'Invalid UTR.']);
 }
 
-$dailyLimit = (float)(getenv('DAILY_LIMIT_INR') ?: 5000);
-if (getUserDailyTotal($userId) >= $dailyLimit) {
-    jsonResponse(429, ['status' => 'error', 'message' => 'Daily top-up limit reached. Try again tomorrow.']);
+if ($amount <= 0) {
+    jsonResponse(400, ['status' => 'error', 'message' => 'Invalid amount.']);
 }
 
-$contentType = $_SERVER['CONTENT_TYPE'] ?? '';
-if (strpos($contentType, 'application/json') !== false) {
-    $input = json_decode(file_get_contents('php://input'), true) ?? [];
-} else {
-    $input = $_POST;
+// ── Duplicate check ───────────────────────────────────────────
+$existing = getDB()->payments->findOne(['utr' => $utr, 'status' => 'success']);
+if ($existing) {
+    jsonResponse(409, ['status' => 'error', 'message' => 'This UTR is already verified.']);
 }
 
-$input['user_id'] = $userId;
+// ── Verify with BharatPe ──────────────────────────────────────
+$result = verifyWithBharatPe($utr, $amount);
 
+// ── Save to MongoDB (for dashboard later) ─────────────────────
 try {
-    ['utr' => $utr, 'amount' => $amount, 'user_id' => $userId] = validatePaymentInput($input);
-} catch (InvalidArgumentException $e) {
-    jsonResponse(400, ['status' => 'error', 'message' => $e->getMessage()]);
+    getDB()->payments->updateOne(
+        ['utr' => $utr],
+        ['$set' => [
+            'utr'        => $utr,
+            'amount'     => $amount,
+            'status'     => $result === true ? 'success' : 'failed',
+            'updated_at' => new MongoDB\BSON\UTCDateTime(),
+        ],
+        '$setOnInsert' => [
+            'created_at' => new MongoDB\BSON\UTCDateTime(),
+        ]],
+        ['upsert' => true]
+    );
+} catch (Throwable $e) {
+    error_log('[verify] DB save error: ' . $e->getMessage());
 }
 
-enforceRateLimit('utr_attempt', 3, 300, $utr);
-
-try {
-    $paymentId = insertPendingPayment($userId, $utr, $amount);
-} catch (RuntimeException $e) {
-    jsonResponse(409, ['status' => 'error', 'message' => $e->getMessage()]);
-} catch (Throwable) {
-    jsonResponse(500, ['status' => 'error', 'message' => 'Database error. Please try again.']);
+// ── Respond ───────────────────────────────────────────────────
+if ($result === true) {
+    jsonResponse(200, ['status' => 'success', 'message' => 'Payment verified.']);
 }
 
-$verified = verifyWithBharatPe($utr, $amount, $userId);
-
-if ($verified === null) {
-    jsonResponse(200, ['status' => 'pending', 'message' => 'Verifying automatically.', 'utr' => $utr]);
-}
-
-if ($verified === true) {
-    try {
-        finalisePayment($paymentId, $userId, $amount, true);
-    } catch (Throwable) {
-        jsonResponse(500, ['status' => 'error', 'message' => 'Failed to credit wallet.']);
-    }
-    jsonResponse(200, [
-        'status'  => 'success',
-        'message' => 'Payment verified. Wallet credited.',
-        'balance' => getUserBalance($userId),
-    ]);
-}
-
-jsonResponse(200, ['status' => 'pending', 'message' => 'Payment not found yet. Keep checking.', 'utr' => $utr]);
+jsonResponse(200, ['status' => 'failed', 'message' => 'Payment not found.']);
