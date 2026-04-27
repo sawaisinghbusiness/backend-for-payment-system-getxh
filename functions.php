@@ -6,7 +6,7 @@ require_once __DIR__ . '/db.php';
 use MongoDB\BSON\ObjectId;
 use MongoDB\BSON\UTCDateTime;
 
-define('BHARATPE_MAX_AGE_SECONDS',  30 * 60);
+define('BHARATPE_MAX_AGE_SECONDS',  24 * 60 * 60); // 24 hours
 define('BHARATPE_TXN_SCAN_LIMIT',  20);
 define('BHARATPE_MAX_RETRIES',     2);
 define('BHARATPE_FAIL_THRESHOLD',  5);
@@ -238,7 +238,7 @@ function verifyWithBharatPe(string $utr, float $amount, string $userId = '')
         }
 
         $txnTime = intval($txn['paymentTimestamp'] ?? 0) / 1000;
-        if (abs(time() - $txnTime) > 1800) {
+        if (abs(time() - $txnTime) > BHARATPE_MAX_AGE_SECONDS) {
             logBharatPe('stale_transaction', ['utr' => $utr]);
             continue;
         }
