@@ -156,13 +156,34 @@ function verifyWithBharatPe(string $utr, float $amount, string $userId = '')
         return true;
     }
 
-    $token  = trim((string)(getenv('BHARATPE_TOKEN')  ?: ''));
-    $apiUrl = trim((string)(getenv('BHARATPE_API_URL') ?: ''));
+    $token      = trim((string)(getenv('BHARATPE_TOKEN')      ?: ''));
+    $baseUrl    = trim((string)(getenv('BHARATPE_API_URL')    ?: ''));
+    $merchantId = trim((string)(getenv('BHARATPE_MERCHANT_ID') ?: ''));
 
-    if ($token === '' || $apiUrl === '') {
-        error_log('[BharatPe] BHARATPE_TOKEN or BHARATPE_API_URL not set.');
+    if ($token === '' || $baseUrl === '' || $merchantId === '') {
+        error_log('[BharatPe] BHARATPE_TOKEN, BHARATPE_API_URL or BHARATPE_MERCHANT_ID not set.');
         return null;
     }
+
+    // Build date range for today in IST (UTC+5:30)
+    $istOffset = 19800;
+    $nowIst    = time() + $istOffset;
+    $y = (int)gmdate('Y', $nowIst);
+    $m = (int)gmdate('n', $nowIst);
+    $d = (int)gmdate('j', $nowIst);
+
+    $sDate = (gmmktime(0,  0,  0,  $m, $d, $y) - $istOffset) * 1000;
+    $eDate = (gmmktime(23, 59, 59, $m, $d, $y) - $istOffset) * 1000;
+
+    $apiUrl = $baseUrl . '?' . http_build_query([
+        'module'            => 'PAYMENT_QR',
+        'merchantId'        => $merchantId,
+        'sDate'             => $sDate,
+        'eDate'             => $eDate,
+        'pageSize'          => 100,
+        'pageCount'         => 0,
+        'isFromOtDashboard' => 1,
+    ]);
 
     $headers  = ['token: ' . $token, 'accept: application/json'];
     $response = null;
