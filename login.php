@@ -16,8 +16,6 @@ define('FIXED_PASS',  'PIKACHUNIKITA1625');
 $error = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    verifyCsrf();
-
     $email    = strtolower(trim((string)($_POST['email']    ?? '')));
     $password = (string)($_POST['password'] ?? '');
 

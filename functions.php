@@ -471,10 +471,12 @@ function startSession(): void
         $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
             || ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https';
 
+        ini_set('session.save_path', '/tmp');
+
         session_start([
             'cookie_httponly' => true,
             'cookie_secure'   => $isHttps,
-            'cookie_samesite' => 'Strict',
+            'cookie_samesite' => 'Lax',
             'use_strict_mode' => true,
         ]);
     }
