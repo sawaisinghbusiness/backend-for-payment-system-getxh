@@ -8,8 +8,8 @@ function getDB(): MongoDB\Database
     static $db = null;
     if ($db !== null) return $db;
 
-    $uri    = getenv('MONGODB_URI') ?: 'mongodb://localhost:27017';
-    $dbName = getenv('MONGODB_DB')  ?: 'upi_wallet';
+    $uri    = trim(getenv('MONGODB_URI') ?: 'mongodb://localhost:27017');
+    $dbName = trim(getenv('MONGODB_DB')  ?: 'upi_wallet');
 
     $client = new MongoDB\Client($uri);
     $db     = $client->selectDatabase($dbName);
