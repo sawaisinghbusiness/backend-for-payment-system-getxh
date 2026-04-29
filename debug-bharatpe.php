@@ -42,7 +42,11 @@ $err  = curl_error($ch);
 curl_close($ch);
 
 echo json_encode([
-    'http_code'    => $code,
-    'curl_error'   => $err,
-    'raw_response' => json_decode($raw, true),
+    'http_code'      => $code,
+    'curl_error'     => $err,
+    'raw_response'   => json_decode($raw, true),
+    'debug_api_url'  => $apiUrl,
+    'debug_base_url' => $baseUrl,
+    'debug_token_len'=> strlen($token),
+    'debug_merchant' => $merchantId,
 ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
