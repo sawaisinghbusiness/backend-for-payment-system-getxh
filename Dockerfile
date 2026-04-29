@@ -41,6 +41,9 @@ RUN rm -f .env backup.sh migrate.sql schema.sql \
     && chown -R www-data:www-data /var/www/html \
     && chmod -R 755 /var/www/html
 
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
+
 EXPOSE 80
 
-CMD ["apache2-foreground"]
+CMD ["/start.sh"]
