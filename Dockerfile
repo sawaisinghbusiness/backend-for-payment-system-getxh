@@ -16,8 +16,11 @@ RUN pecl install mongodb-1.16.2 \
 # Composer
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
-# Fix MPM conflict — disable event, enable prefork (required for PHP)
-RUN a2dismod mpm_event || true && a2enmod mpm_prefork rewrite headers
+# Fix MPM conflict — remove all MPM configs, only keep prefork
+RUN rm -f /etc/apache2/mods-enabled/mpm_*.load /etc/apache2/mods-enabled/mpm_*.conf \
+    && ln -s /etc/apache2/mods-available/mpm_prefork.load /etc/apache2/mods-enabled/mpm_prefork.load \
+    && ln -s /etc/apache2/mods-available/mpm_prefork.conf /etc/apache2/mods-enabled/mpm_prefork.conf \
+    && a2enmod rewrite headers
 
 # Apache VirtualHost with AllowOverride All
 RUN { \
