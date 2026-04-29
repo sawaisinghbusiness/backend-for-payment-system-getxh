@@ -246,8 +246,10 @@ function verifyWithBharatPe(string $utr, float $amount, string $userId = '')
         if (($txn['status'] ?? '') !== 'SUCCESS')      continue;
         if (($txn['type']   ?? '') !== 'PAYMENT_RECV') continue;
 
-        $apiUtr = preg_replace('/\s+/', '', strtolower((string)($txn['bankReferenceNo'] ?? '')));
-        if ($apiUtr === '' || $apiUtr !== $userUtr)    continue;
+        $apiUtr1 = preg_replace('/\s+/', '', strtolower((string)($txn['bankReferenceNo'] ?? '')));
+        $apiUtr2 = preg_replace('/\s+/', '', strtolower((string)($txn['internalUtr']    ?? '')));
+        if (($apiUtr1 === '' || $apiUtr1 !== $userUtr) &&
+            ($apiUtr2 === '' || $apiUtr2 !== $userUtr)) continue;
 
         $apiAmount = round((float)($txn['amount'] ?? 0), 2);
         if ($apiAmount <= 0)                           continue;
