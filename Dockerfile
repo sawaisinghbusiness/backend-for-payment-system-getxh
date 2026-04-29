@@ -16,8 +16,8 @@ RUN pecl install mongodb-1.16.2 \
 # Composer
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
-# Enable Apache modules
-RUN a2enmod rewrite headers
+# Fix MPM conflict — disable event, enable prefork (required for PHP)
+RUN a2dismod mpm_event || true && a2enmod mpm_prefork rewrite headers
 
 # Apache VirtualHost with AllowOverride All
 RUN { \
