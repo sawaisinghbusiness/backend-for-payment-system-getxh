@@ -15,4 +15,7 @@ APACHE_PORT=${PORT:-80}
 sed -i "s/^Listen 80$/Listen ${APACHE_PORT}/" /etc/apache2/ports.conf
 sed -i "s/<VirtualHost \*:80>/<VirtualHost *:${APACHE_PORT}>/" /etc/apache2/sites-enabled/000-default.conf
 
+# Self-ping every 4 minutes to prevent Railway sleep
+(while true; do sleep 240; curl -s "${RAILWAY_PUBLIC_DOMAIN:+https://$RAILWAY_PUBLIC_DOMAIN/ping.php}" > /dev/null 2>&1 || true; done) &
+
 exec apache2-foreground
