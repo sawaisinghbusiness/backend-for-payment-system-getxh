@@ -501,7 +501,23 @@ function startSession(): void
             'cookie_secure'   => $isHttps,
             'cookie_samesite' => 'Lax',
             'use_strict_mode' => true,
+            'gc_maxlifetime'  => 1800,
         ]);
+
+        // Expire session after 30 minutes of inactivity
+        if (isset($_SESSION['last_activity']) && (time() - $_SESSION['last_activity']) > 1800) {
+            session_unset();
+            session_destroy();
+            session_start([
+                'cookie_httponly' => true,
+                'cookie_secure'   => $isHttps,
+                'cookie_samesite' => 'Lax',
+                'use_strict_mode' => true,
+                'gc_maxlifetime'  => 1800,
+            ]);
+        }
+
+        $_SESSION['last_activity'] = time();
     }
 }
 

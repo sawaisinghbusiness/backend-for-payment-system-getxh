@@ -10,49 +10,59 @@ if (getSessionUserId() !== null) {
     exit;
 }
 
-define('FIXED_EMAIL', 'agency@getxh.in');
-define('FIXED_PASS',  'PIKACHUNIKITA1625');
+$fixedEmail = strtolower(trim((string)(getenv('WALLET_USER_EMAIL') ?: 'agency@getxh.in')));
+$fixedHash  = (string)(getenv('WALLET_USER_PASS_HASH') ?: '');
 
 $error = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    verifyCsrf();
+
     $email    = strtolower(trim((string)($_POST['email']    ?? '')));
     $password = (string)($_POST['password'] ?? '');
 
+    // Rate limit: 5 attempts per IP per 5 min, 3 per email per 5 min
+    enforceRateLimit('user_login', 5, 300, $email, 3);
+
     usleep(200_000);
 
-    if ($email === FIXED_EMAIL && $password === FIXED_PASS) {
+    $valid = $email === $fixedEmail
+          && $fixedHash !== ''
+          && password_verify($password, $fixedHash);
+
+    if ($valid) {
         try {
             $db   = getDB();
-            $user = $db->users->findOne(['email' => FIXED_EMAIL]);
+            $user = $db->users->findOne(['email' => $fixedEmail]);
 
             if (!$user) {
                 $result = $db->users->insertOne([
-                    'name'         => 'Agency GetXH',
-                    'email'        => FIXED_EMAIL,
-                    'password'     => password_hash(FIXED_PASS, PASSWORD_BCRYPT),
-                    'balance'      => 0.0,
-                    'is_suspicious'=> false,
-                    'created_at'   => new MongoDB\BSON\UTCDateTime(),
+                    'name'          => 'Agency GetXH',
+                    'email'         => $fixedEmail,
+                    'password'      => $fixedHash,
+                    'balance'       => 0.0,
+                    'is_suspicious' => false,
+                    'created_at'    => new MongoDB\BSON\UTCDateTime(),
                 ]);
                 $userId = (string)$result->getInsertedId();
                 $name   = 'Agency GetXH';
             } else {
                 $userId = (string)$user['_id'];
-                $name   = (string)$user['name'];
+                $name   = (string)($user['name'] ?? 'Agency GetXH');
             }
 
             session_regenerate_id(true);
-            $_SESSION['user_id']    = $userId;
-            $_SESSION['user_name']  = $name;
-            $_SESSION['user_email'] = FIXED_EMAIL;
+            $_SESSION['user_id']       = $userId;
+            $_SESSION['user_name']     = $name;
+            $_SESSION['user_email']    = $fixedEmail;
+            $_SESSION['last_activity'] = time();
 
             header('Location: pay.php');
             exit;
 
         } catch (Throwable $e) {
             error_log('[login] ' . $e->getMessage());
-            $error = 'Database error: ' . $e->getMessage();
+            $error = 'Something went wrong. Please try again.';
         }
     } else {
         $error = 'Invalid email or password.';
