@@ -13,10 +13,20 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     jsonResponse(405, ['status' => 'error', 'message' => 'Method not allowed.']);
 }
 
+// ── Admin CSRF verification ───────────────────────────────────
+$submittedCsrf = $_SERVER['HTTP_X_ADMIN_CSRF'] ?? ($_POST['csrf_token'] ?? '');
+$sessionCsrf   = $_SESSION['admin_csrf'] ?? '';
+if ($sessionCsrf === '' || !hash_equals($sessionCsrf, $submittedCsrf)) {
+    logSecurityEvent('admin_csrf_failure', ['action' => 'payment_override']);
+    jsonResponse(403, ['status' => 'error', 'message' => 'Invalid request token.']);
+}
+
+// ── Rate limit admin actions ──────────────────────────────────
+enforceRateLimit('admin_action', 30, 60);
+
 $paymentId = trim($_POST['payment_id'] ?? '');
 $action    = trim($_POST['action']     ?? '');
 
-// Validate ObjectId format (24-char hex)
 if (!preg_match('/^[a-f0-9]{24}$/', $paymentId) || !in_array($action, ['approve', 'reject'], true)) {
     jsonResponse(400, ['status' => 'error', 'message' => 'Invalid parameters.']);
 }
@@ -39,11 +49,12 @@ try {
         $action === 'approve'
     );
 } catch (Throwable $e) {
-    jsonResponse(500, ['status' => 'error', 'message' => 'Action failed: ' . $e->getMessage()]);
+    error_log('[admin_action] ' . $e->getMessage());
+    jsonResponse(500, ['status' => 'error', 'message' => 'Action failed. Please try again.']);
 }
 
 $label = $action === 'approve' ? 'approved & wallet credited' : 'rejected';
-
 logBharatPe('admin_override', ['payment_id' => $paymentId, 'action' => $action]);
+logSecurityEvent('admin_payment_action', ['payment_id' => $paymentId, 'action' => $action]);
 
 jsonResponse(200, ['status' => 'ok', 'message' => "Payment {$label}."]);

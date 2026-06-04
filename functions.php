@@ -22,6 +22,18 @@ function logBharatPe(string $event, array $ctx = []): void
     ));
 }
 
+// ── Security event logger ─────────────────────────────────────
+function logSecurityEvent(string $event, array $ctx = []): void
+{
+    $ip = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+    $ip = explode(',', $ip)[0]; // take first IP if behind proxy
+    $ua = substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 150);
+    error_log('[SECURITY] ' . json_encode(
+        array_merge(['event' => $event, 'ts' => time(), 'ip' => trim($ip), 'ua' => $ua], $ctx),
+        JSON_UNESCAPED_UNICODE
+    ));
+}
+
 // ── API failure tracker ───────────────────────────────────────
 function trackApiFailure(): void
 {
@@ -483,6 +495,7 @@ function enforceRateLimit(
     int    $idLimit    = 0
 ): void {
     if (!checkRateLimit($action, $limit, $seconds, $identifier, $idLimit)) {
+        logSecurityEvent('rate_limit_hit', ['action' => $action, 'identifier' => $identifier]);
         jsonResponse(429, ['status' => 'error', 'message' => 'Too many attempts. Please wait.']);
     }
 }

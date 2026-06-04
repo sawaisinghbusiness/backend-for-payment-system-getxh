@@ -57,6 +57,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $_SESSION['user_email']    = $fixedEmail;
             $_SESSION['last_activity'] = time();
 
+            logSecurityEvent('login_success', ['email' => $fixedEmail]);
             header('Location: pay.php');
             exit;
 
@@ -65,6 +66,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $error = 'Something went wrong. Please try again.';
         }
     } else {
+        logSecurityEvent('login_failure', ['email' => $email]);
         $error = 'Invalid email or password.';
     }
 }

@@ -3,6 +3,11 @@ declare(strict_types=1);
 require_once __DIR__ . '/auth.php';
 require_once __DIR__ . '/../functions.php';
 
+if (empty($_SESSION['admin_csrf'])) {
+    $_SESSION['admin_csrf'] = bin2hex(random_bytes(32));
+}
+$adminCsrf = $_SESSION['admin_csrf'];
+
 // ── Pagination / filter params ──────────────────────────────
 $statusFilter = in_array($_GET['status'] ?? '', ['', 'pending', 'success', 'failed'], true)
     ? ($_GET['status'] ?? '')
@@ -50,6 +55,7 @@ function statusBadge(string $status): string
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="admin-csrf" content="<?= htmlspecialchars($adminCsrf) ?>">
 <title>Payments — UPI Wallet Admin</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -448,7 +454,11 @@ function adminAction(paymentId, action) {
   body.append('payment_id', paymentId);
   body.append('action', action);
 
-  fetch('action.php', { method: 'POST', body })
+  fetch('action.php', {
+    method: 'POST',
+    body,
+    headers: { 'X-Admin-CSRF': document.querySelector('meta[name="admin-csrf"]').content }
+  })
     .then(r => r.json())
     .then(data => {
       if (data.status === 'ok') {
