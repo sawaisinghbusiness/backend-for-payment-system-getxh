@@ -16,7 +16,7 @@ if ($allowedOrigin !== '' && $requestOrigin === $allowedOrigin) {
 header('Content-Type: application/json');
 header('X-Content-Type-Options: nosniff');
 header('Access-Control-Allow-Methods: POST, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type, X-CSRF-Token');
+header('Access-Control-Allow-Headers: Content-Type, X-CSRF-Token, Authorization');
 header('Vary: Origin');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
@@ -28,11 +28,22 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     jsonResponse(405, ['status' => 'error', 'message' => 'Method not allowed.']);
 }
 
-// ── Require authenticated session ────────────────────────────
-$userId = requireUserSession();
+// ── Parse input ───────────────────────────────────────────────
+$input  = json_decode(file_get_contents('php://input'), true) ?? [];
+if (empty($input)) $input = $_POST;
 
-// ── CSRF verification ─────────────────────────────────────────
-verifyCsrf();
+// ── Authenticate User ─────────────────────────────────────────
+$userId = getSessionUserId();
+if ($userId === null) {
+    // Public frontend client sends the user uid in the JSON body
+    $userId = !empty($input['uid']) ? trim((string)$input['uid']) : null;
+    if ($userId === null) {
+        jsonResponse(401, ['status' => 'error', 'message' => 'Not authenticated. Please log in.']);
+    }
+} else {
+    // Only enforce CSRF for session-based admin portal actions
+    verifyCsrf();
+}
 
 // ── Rate limit: 3 attempts per IP per minute ─────────────────
 enforceRateLimit('verify_payment', 3, 60, $userId, 3);
@@ -41,10 +52,6 @@ if (isUserSuspicious($userId)) {
     logSecurityEvent('blocked_suspicious_user', ['user_id' => $userId]);
     jsonResponse(403, ['status' => 'error', 'message' => 'Account temporarily restricted.']);
 }
-
-// ── Parse & validate input ───────────────────────────────────
-$input  = json_decode(file_get_contents('php://input'), true) ?? [];
-if (empty($input)) $input = $_POST;
 
 $utr    = strtoupper(trim(preg_replace('/[^A-Za-z0-9]/', '', $input['utr'] ?? '')));
 $amount = round((float)($input['amount'] ?? 0), 2);
