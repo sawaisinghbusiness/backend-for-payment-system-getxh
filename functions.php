@@ -218,6 +218,8 @@ function verifyWithBharatPe(string $utr, float $amount, string $userId = '')
 
         if ($raw !== false && $curlErr === '' && $httpCode === 200) {
             $response = $raw;
+            file_put_contents('/tmp/bharatpe_response.json', $response);
+logBharatPe('raw_response', ['body' => $response]);
             break;
         }
 
