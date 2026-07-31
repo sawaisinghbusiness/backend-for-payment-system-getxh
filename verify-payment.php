@@ -84,6 +84,7 @@ if ($existing) {
 
 // ── Verify with BharatPe ──────────────────────────────────────
 $result = verifyWithBharatPe($utr, $amount, $userId);
+error_log('[DEBUG] verifyWithBharatPe result = ' . var_export($result, true));
 
 // ── Persist with user ownership ──────────────────────────────
 try {
